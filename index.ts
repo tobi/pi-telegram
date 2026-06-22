@@ -174,7 +174,7 @@ const MAX_RICH_MESSAGE_LENGTH = 32768;
 // before any content arrives (empty rich markdown is rejected by the API).
 const THINKING_PLACEHOLDER = "<tg-thinking>Working\u2026</tg-thinking>";
 const MAX_ATTACHMENTS_PER_TURN = 10;
-const PREVIEW_THROTTLE_MS = 250;
+const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
 
@@ -316,6 +316,22 @@ export default function (pi: ExtensionAPI) {
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
 	let nextDraftId = 0;
+
+	// Opt-in diagnostics: set TELEGRAM_DEBUG=1 to log streaming events and every
+	// Telegram API request/response (in/out) to files under the temp dir.
+	const debugEnabled = process.env.TELEGRAM_DEBUG === "1";
+	const DEBUG_LOG = join(TEMP_DIR, "stream-debug.log");
+	const WIRE_LOG = join(TEMP_DIR, "telegram-wire.log");
+	function debugLog(msg: string): void {
+		if (!debugEnabled) return;
+		void writeFile(DEBUG_LOG, `${new Date().toISOString()} ${msg}\n`, { flag: "a" }).catch(() => undefined);
+	}
+	function wireLog(direction: "OUT" | "IN" | "OUT-RESP" | "OUT-ERR", label: string, payload: unknown): void {
+		if (!debugEnabled) return;
+		let body: string;
+		try { body = JSON.stringify(payload); } catch { body = String(payload); }
+		void writeFile(WIRE_LOG, `${new Date().toISOString()} ${direction} ${label} ${body}\n`, { flag: "a" }).catch(() => undefined);
+	}
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 
 	function allocateDraftId(): number {
@@ -356,6 +372,7 @@ export default function (pi: ExtensionAPI) {
 		options?: { signal?: AbortSignal },
 	): Promise<TResponse> {
 		if (!config.botToken) throw new Error("Telegram bot token is not configured");
+		if (method !== "getUpdates") wireLog("OUT", method, body);
 		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -364,8 +381,10 @@ export default function (pi: ExtensionAPI) {
 		});
 			const data = (await response.json()) as TelegramApiResponse<TResponse>;
 		if (!data.ok || data.result === undefined) {
+			if (method !== "getUpdates") wireLog("OUT-ERR", method, data);
 			throw new Error(data.description || `Telegram API ${method} failed`);
 		}
+		if (method !== "getUpdates") wireLog("OUT-RESP", method, data.result);
 		return data.result;
 	}
 
@@ -384,6 +403,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		const buffer = await readFile(filePath);
 		form.set(fileField, new Blob([buffer]), fileName);
+		wireLog("OUT", `${method} (multipart)`, { ...fields, [fileField]: `<file ${fileName} ${buffer.length}b>` });
 		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
 			method: "POST",
 			body: form,
@@ -391,8 +411,10 @@ export default function (pi: ExtensionAPI) {
 		});
 		const data = (await response.json()) as TelegramApiResponse<TResponse>;
 		if (!data.ok || data.result === undefined) {
+			wireLog("OUT-ERR", `${method} (multipart)`, data);
 			throw new Error(data.description || `Telegram API ${method} failed`);
 		}
+		wireLog("OUT-RESP", `${method} (multipart)`, data.result);
 		return data.result;
 	}
 
@@ -537,11 +559,13 @@ export default function (pi: ExtensionAPI) {
 		state.flushTimer = undefined;
 		const markdown = buildDraftMarkdown(state.phase, state.pendingTools, state.pendingText);
 		if (!markdown || markdown === state.lastSentText) {
+			debugLog(`flush skip phase=${state.phase} len=${markdown.length} same=${markdown === state.lastSentText}`);
 			return;
 		}
 		const draftId = state.draftId ?? allocateDraftId();
 		state.draftId = draftId;
 		const ok = await sendRichDraft(chatId, draftId, markdown);
+		debugLog(`flush draft id=${draftId} phase=${state.phase} len=${markdown.length} ok=${ok}`);
 		if (ok) {
 			state.mode = "draft";
 			state.lastSentText = markdown;
@@ -572,6 +596,7 @@ export default function (pi: ExtensionAPI) {
 		const draftId = state.draftId ?? allocateDraftId();
 		state.draftId = draftId;
 		const ok = await sendRichDraft(chatId, draftId, THINKING_PLACEHOLDER);
+		debugLog(`openThinkingDraft id=${draftId} ok=${ok}`);
 		if (ok) state.lastSentText = THINKING_PLACEHOLDER;
 	}
 
@@ -1008,6 +1033,7 @@ export default function (pi: ExtensionAPI) {
 					{ signal },
 				);
 				for (const update of updates) {
+					wireLog("IN", "update", update);
 					config.lastUpdateId = update.update_id;
 					await writeConfig(config);
 					await handleUpdate(update, ctx);
@@ -1179,6 +1205,7 @@ export default function (pi: ExtensionAPI) {
 		ensurePreviewState();
 		const text = getMessageText(event.message);
 		previewState!.pendingText = text;
+		debugLog(`message_update phase=${previewState!.phase} text=${text.length} tools=${previewState!.pendingTools.length}`);
 		// Answer text arriving advances us out of thinking/tools into answering.
 		if (text.trim().length > 0) {
 			transitionTo(previewState!, "answering");
