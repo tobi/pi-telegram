@@ -15,7 +15,8 @@
     "url": "https://github.com/badlogic/pi-telegram/issues"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": ["./index.ts"],
+    "skills": ["./skills"]
   },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",

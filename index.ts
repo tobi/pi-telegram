@@ -137,11 +137,26 @@ interface QueuedAttachment {
 	fileName: string;
 }
 
+interface TelegramToolCall {
+	name: string;
+	line: string;
+}
+
+// Lifecycle phase of a draft segment. Transitions must be monotonic; illegal
+// transitions are logged and ignored so a malformed event never corrupts the
+// stream.
+type DraftPhase = "thinking" | "tools" | "answering" | "done";
+
+function phaseRank(phase: DraftPhase): number {
+	return phase === "thinking" ? 0 : phase === "tools" ? 1 : phase === "answering" ? 2 : 3;
+}
+
 interface TelegramPreviewState {
 	mode: "draft" | "message";
 	draftId?: number;
-	messageId?: number;
+	phase: DraftPhase;
 	pendingText: string;
+	pendingTools: TelegramToolCall[];
 	lastSentText: string;
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
@@ -154,9 +169,12 @@ interface TelegramMediaGroupState {
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
-const MAX_MESSAGE_LENGTH = 4096;
+const MAX_RICH_MESSAGE_LENGTH = 32768;
+// Shown immediately at the start of a turn so the "Thinking…" bubble appears
+// before any content arrives (empty rich markdown is rejected by the API).
+const THINKING_PLACEHOLDER = "<tg-thinking>Working\u2026</tg-thinking>";
 const MAX_ATTACHMENTS_PER_TURN = 10;
-const PREVIEW_THROTTLE_MS = 750;
+const PREVIEW_THROTTLE_MS = 250;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
 
@@ -166,7 +184,9 @@ Telegram bridge extension is active.
 - Messages forwarded from Telegram are prefixed with "[telegram]".
 - [telegram] messages may include local temp file paths for Telegram attachments. Read those files as needed.
 - If a [telegram] user asked for a file or generated artifact, use the telegram_attach tool with the local file path so the extension can send it with your next final reply.
-- Do not assume mentioning a local file path in plain text will send it to Telegram. Use telegram_attach.`;
+- Do not assume mentioning a local file path in plain text will send it to Telegram. Use telegram_attach.
+- Replies are rendered with Telegram Rich Markdown (GitHub-Flavored Markdown + a few HTML tags). Write normal Markdown freely: headings, **bold**, *italic*, ~~strikethrough~~, ||spoilers||, \`inline code\`, fenced code blocks, lists, task lists, tables, > block quotes, $LaTeX$, and links. See the "telegram-rich-markdown" skill for the full supported syntax.
+- Do not wrap your whole answer in a code block unless it is actually code. Do not manually add <tg-thinking> tags.`;
 
 function isTelegramPrompt(prompt: string): boolean {
 	return prompt.trimStart().startsWith(TELEGRAM_PREFIX);
@@ -213,7 +233,7 @@ function formatTokens(count: number): string {
 }
 
 function chunkParagraphs(text: string): string[] {
-	if (text.length <= MAX_MESSAGE_LENGTH) return [text];
+	if (text.length <= MAX_RICH_MESSAGE_LENGTH) return [text];
 
 	const normalized = text.replace(/\r\n/g, "\n");
 	const paragraphs = normalized.split(/\n\n+/);
@@ -226,13 +246,13 @@ function chunkParagraphs(text: string): string[] {
 	};
 
 	const splitLongBlock = (block: string): string[] => {
-		if (block.length <= MAX_MESSAGE_LENGTH) return [block];
+		if (block.length <= MAX_RICH_MESSAGE_LENGTH) return [block];
 		const lines = block.split("\n");
 		const lineChunks: string[] = [];
 		let lineCurrent = "";
 		for (const line of lines) {
 			const candidate = lineCurrent.length === 0 ? line : `${lineCurrent}\n${line}`;
-			if (candidate.length <= MAX_MESSAGE_LENGTH) {
+			if (candidate.length <= MAX_RICH_MESSAGE_LENGTH) {
 				lineCurrent = candidate;
 				continue;
 			}
@@ -240,12 +260,12 @@ function chunkParagraphs(text: string): string[] {
 				lineChunks.push(lineCurrent);
 				lineCurrent = "";
 			}
-			if (line.length <= MAX_MESSAGE_LENGTH) {
+			if (line.length <= MAX_RICH_MESSAGE_LENGTH) {
 				lineCurrent = line;
 				continue;
 			}
-			for (let i = 0; i < line.length; i += MAX_MESSAGE_LENGTH) {
-				lineChunks.push(line.slice(i, i + MAX_MESSAGE_LENGTH));
+			for (let i = 0; i < line.length; i += MAX_RICH_MESSAGE_LENGTH) {
+				lineChunks.push(line.slice(i, i + MAX_RICH_MESSAGE_LENGTH));
 			}
 		}
 		if (lineCurrent.length > 0) lineChunks.push(lineCurrent);
@@ -257,7 +277,7 @@ function chunkParagraphs(text: string): string[] {
 		const parts = splitLongBlock(paragraph);
 		for (const part of parts) {
 			const candidate = current.length === 0 ? part : `${current}\n\n${part}`;
-			if (candidate.length <= MAX_MESSAGE_LENGTH) {
+			if (candidate.length <= MAX_RICH_MESSAGE_LENGTH) {
 				current = candidate;
 			} else {
 				flushCurrent();
@@ -295,7 +315,6 @@ export default function (pi: ExtensionAPI) {
 	let preserveQueuedTurnsAsHistory = false;
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
-	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 
@@ -429,75 +448,131 @@ export default function (pi: ExtensionAPI) {
 			.trim();
 	}
 
-	async function clearPreview(chatId: number): Promise<void> {
+	// One-line summary of a tool call for the draft's bash block, e.g.
+	//   bash: ls -la
+	//   read: src/index.ts
+	function summarizeTool(name: string, input: Record<string, unknown>): string {
+		const parts: string[] = [];
+		if (name === "bash" && typeof input.command === "string") {
+			parts.push(input.command.replace(/\n/g, " "));
+		} else if ((name === "read" || name === "write") && typeof input.path === "string") {
+			parts.push(input.path);
+		} else if (name === "edit" && typeof input.path === "string") {
+			parts.push(input.path);
+		} else {
+			for (const [k, v] of Object.entries(input)) {
+				if (typeof v === "string") parts.push(`${k}=${v.replace(/\n/g, " ")}`);
+			}
+		}
+		return parts.slice(0, 1).join(" ");
+	}
+
+	// Draft body, driven by the segment phase:
+	//   thinking  -> static "Thinking…" block
+	//   tools     -> fenced bash block of tool calls (one per line)
+	//   answering -> tools block (if any) + answer text so far
+	//   done      -> same as answering (final frame before persist)
+	function buildDraftMarkdown(phase: DraftPhase, tools: TelegramToolCall[], text: string): string {
+		if (phase === "thinking") return THINKING_PLACEHOLDER;
+		const a = (text ?? "").trim();
+		const toolList = Array.isArray(tools) ? tools : [];
+		const parts: string[] = [];
+		if (toolList.length > 0) parts.push("```bash\n" + toolList.map((tool) => tool.line).join("\n") + "\n```");
+		if (a) parts.push(a);
+		return parts.join("\n\n");
+	}
+
+	// Persist a final rich message. Pure rich flow: sendRichMessage only, chunked
+	// at the rich-message limit for very long output. No plain-text fallback.
+	async function sendRich(chatId: number, markdown: string): Promise<number | undefined> {
+		const text = markdown.trim();
+		if (!text) return undefined;
+		let lastMessageId: number | undefined;
+		for (const chunk of chunkParagraphs(text, MAX_RICH_MESSAGE_LENGTH)) {
+			const sent = await callTelegram<TelegramSentMessage>("sendRichMessage", {
+				chat_id: chatId,
+				rich_message: { markdown: chunk },
+			});
+			lastMessageId = sent.message_id;
+		}
+		return lastMessageId;
+	}
+
+	// Stream a partial rich message draft. Pure rich flow: sendRichMessageDraft
+	// only. Returns false on transient errors (e.g. partial markdown mid-stream)
+	// so the caller skips that frame; the next frame retries. No plain fallback.
+	async function sendRichDraft(chatId: number, draftId: number, markdown: string): Promise<boolean> {
+		const body = markdown.slice(0, MAX_RICH_MESSAGE_LENGTH);
+		if (!body) return false; // empty markdown is invalid; never send it
+		try {
+			await callTelegram("sendRichMessageDraft", {
+				chat_id: chatId,
+				draft_id: draftId,
+				rich_message: { markdown: body },
+			});
+			return true;
+		} catch (error) {
+			// Transient partial-markdown errors mid-stream are common; just skip this
+			// frame and let the next one retry.
+			void error;
+			return false;
+		}
+	}
+
+	async function clearPreview(_chatId: number): Promise<void> {
 		const state = previewState;
 		if (!state) return;
 		if (state.flushTimer) {
 			clearTimeout(state.flushTimer);
 			state.flushTimer = undefined;
 		}
+		// Rich drafts are ephemeral (~30s); there is no API call to erase one. We
+		// just drop local state and let it expire.
 		previewState = undefined;
-		if (state.mode === "draft" && state.draftId !== undefined) {
-			try {
-				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: state.draftId, text: "" });
-			} catch {
-				// ignore
-			}
-		}
 	}
 
 	async function flushPreview(chatId: number): Promise<void> {
 		const state = previewState;
 		if (!state) return;
 		state.flushTimer = undefined;
-		const text = state.pendingText.trim();
-		if (!text || text === state.lastSentText) return;
-		const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
-
-		if (draftSupport !== "unsupported") {
-			const draftId = state.draftId ?? allocateDraftId();
-			state.draftId = draftId;
-			try {
-				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
-				draftSupport = "supported";
-				state.mode = "draft";
-				state.lastSentText = truncated;
-				return;
-			} catch {
-				draftSupport = "unsupported";
-			}
-		}
-
-		if (state.messageId === undefined) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
-			state.messageId = sent.message_id;
-			state.mode = "message";
-			state.lastSentText = truncated;
+		const markdown = buildDraftMarkdown(state.phase, state.pendingTools, state.pendingText);
+		if (!markdown || markdown === state.lastSentText) {
 			return;
 		}
-		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
-		state.mode = "message";
-		state.lastSentText = truncated;
-	}
-
-	async function openEmptyDraftPreview(chatId: number): Promise<void> {
-		if (draftSupport === "unsupported") return;
-		if (!previewState) {
-			previewState = { mode: "draft", pendingText: "", lastSentText: "" };
-		}
-		const state = previewState;
 		const draftId = state.draftId ?? allocateDraftId();
 		state.draftId = draftId;
-		try {
-			await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: "" });
-			draftSupport = "supported";
+		const ok = await sendRichDraft(chatId, draftId, markdown);
+		if (ok) {
 			state.mode = "draft";
-			state.pendingText = "";
-			state.lastSentText = "";
-		} catch {
-			draftSupport = "unsupported";
-			state.mode = "message";
+			state.lastSentText = markdown;
 		}
+	}
+
+	// Advance the segment phase. Transitions must be monotonic (forward only);
+	// an attempt to move backward or re-enter a completed phase is ignored.
+	function transitionTo(state: TelegramPreviewState, next: DraftPhase): void {
+		if (phaseRank(next) < phaseRank(state.phase)) {
+			console.error(`[pi-telegram] illegal phase transition ${state.phase} -> ${next}; ignoring`);
+			return;
+		}
+		state.phase = next;
+	}
+
+	function ensurePreviewState(): void {
+		if (!previewState) {
+			previewState = { mode: "draft", phase: "thinking", pendingText: "", pendingTools: [], lastSentText: "" };
+		}
+	}
+
+	// Open the draft immediately with a "Thinking…" placeholder so streaming
+	// feels instant. Allocates the stable draft_id used for the rest of the turn.
+	async function openThinkingDraft(chatId: number): Promise<void> {
+		ensurePreviewState();
+		const state = previewState!;
+		const draftId = state.draftId ?? allocateDraftId();
+		state.draftId = draftId;
+		const ok = await sendRichDraft(chatId, draftId, THINKING_PLACEHOLDER);
+		if (ok) state.lastSentText = THINKING_PLACEHOLDER;
 	}
 
 	function schedulePreviewFlush(chatId: number): void {
@@ -510,36 +585,27 @@ export default function (pi: ExtensionAPI) {
 	async function finalizePreview(chatId: number): Promise<boolean> {
 		const state = previewState;
 		if (!state) return false;
-		await flushPreview(chatId);
-		const finalText = (state.pendingText.trim() || state.lastSentText).trim();
-		if (!finalText) {
+		if (state.flushTimer) {
+			clearTimeout(state.flushTimer);
+			state.flushTimer = undefined;
+		}
+		transitionTo(state, "done");
+		// The persisted message keeps the tool block (if any) + the answer text.
+		// The static <tg-thinking> placeholder is draft-only and dropped here.
+		const finalText = state.pendingText.trim();
+		const hasTools = state.pendingTools.length > 0;
+		const markdown = buildDraftMarkdown(state.phase, state.pendingTools, finalText);
+		previewState = undefined;
+		if (!markdown || (!finalText && !hasTools)) {
 			await clearPreview(chatId);
 			return false;
 		}
-		if (state.mode === "draft") {
-			if (state.flushTimer) {
-				clearTimeout(state.flushTimer);
-				state.flushTimer = undefined;
-			}
-			previewState = undefined;
-			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
-			return true;
-		}
-		previewState = undefined;
-		return state.messageId !== undefined;
+		await sendRich(chatId, markdown);
+		return true;
 	}
 
 	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
-		const chunks = chunkParagraphs(text);
-		let lastMessageId: number | undefined;
-		for (const chunk of chunks) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-				chat_id: chatId,
-				text: chunk,
-			});
-			lastMessageId = sent.message_id;
-		}
-		return lastMessageId;
+		return sendRich(chatId, text);
 	}
 
 	async function sendQueuedAttachments(turn: ActiveTelegramTurn): Promise<void> {
@@ -1050,6 +1116,13 @@ export default function (pi: ExtensionAPI) {
 		updateStatus(ctx);
 	});
 
+	// Register the bundled "telegram-rich-markdown" skill so it shows up at startup.
+	pi.on("resources_discover", async () => {
+		return {
+			skillPaths: [join(import.meta.dirname, "skills")],
+		};
+	});
+
 	pi.on("session_shutdown", async (_event, _ctx) => {
 		queuedTelegramTurns = [];
 		for (const state of mediaGroups.values()) {
@@ -1080,8 +1153,8 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns.shift();
 			if (nextTurn) {
 				activeTelegramTurn = { ...nextTurn };
-				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
-				await openEmptyDraftPreview(activeTelegramTurn.chatId);
+				previewState = { mode: "draft", phase: "thinking", pendingText: "", pendingTools: [], lastSentText: "" };
+				await openThinkingDraft(activeTelegramTurn.chatId);
 				startTypingLoop(ctx);
 			}
 		}
@@ -1090,22 +1163,37 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("message_start", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
-		if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
+		// State machine: the previous segment is done. Persist it (sendRichMessage)
+		// BEFORE opening a fresh draft for this segment, so drafts never overlap.
+		if (previewState && phaseRank(previewState.phase) > phaseRank("thinking")) {
 			await finalizePreview(activeTelegramTurn.chatId);
-			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
 		}
 		if (!previewState) {
-			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
-			await openEmptyDraftPreview(activeTelegramTurn.chatId);
+			previewState = { mode: "draft", phase: "thinking", pendingText: "", pendingTools: [], lastSentText: "" };
+			await openThinkingDraft(activeTelegramTurn.chatId);
 		}
 	});
 
 	pi.on("message_update", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
-		if (!previewState) {
-			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+		ensurePreviewState();
+		const text = getMessageText(event.message);
+		previewState!.pendingText = text;
+		// Answer text arriving advances us out of thinking/tools into answering.
+		if (text.trim().length > 0) {
+			transitionTo(previewState!, "answering");
 		}
-		previewState.pendingText = getMessageText(event.message);
+		schedulePreviewFlush(activeTelegramTurn.chatId);
+	});
+
+	// Tool calls are streamed into the draft as a fenced bash block (one tool per
+	// line) so the user sees what's happening while tools run.
+	pi.on("tool_call", async (event, _ctx) => {
+		if (!activeTelegramTurn) return;
+		ensurePreviewState();
+		transitionTo(previewState!, "tools");
+		const line = `${event.toolName}: ${summarizeTool(event.toolName, (event.input ?? {}) as Record<string, unknown>)}`.trim();
+		previewState!.pendingTools.push({ name: event.toolName, line });
 		schedulePreviewFlush(activeTelegramTurn.chatId);
 	});
 
@@ -1133,22 +1221,13 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const finalText = assistant.text;
-		if (previewState) {
-			previewState.pendingText = finalText ?? previewState.pendingText;
+		if (previewState && finalText) {
+			previewState.pendingText = finalText;
 		}
 
-		if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
-			const finalized = await finalizePreview(turn.chatId);
-			if (!finalized && turn.queuedAttachments.length > 0 && !finalText) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
-			}
-		} else {
-			await clearPreview(turn.chatId);
-			if (finalText) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
-			} else if (turn.queuedAttachments.length > 0) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
-			}
+		const finalized = finalText ? await finalizePreview(turn.chatId) : false;
+		if (!finalized && turn.queuedAttachments.length > 0) {
+			await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
 		}
 
 		stopTypingLoop();
